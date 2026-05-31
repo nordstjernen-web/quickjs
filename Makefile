@@ -58,6 +58,14 @@ fuzz:
 	clang -g -O1 -fsanitize=address,undefined,fuzzer -o fuzz fuzz.c
 	./fuzz
 
+fuzz-eval:
+	clang -g -O1 -fsanitize=address,undefined,fuzzer -o fuzz-eval fuzz-eval.c
+	./fuzz-eval
+
+fuzz-regexp:
+	clang -g -O1 -fsanitize=address,undefined,fuzzer -o fuzz-regexp fuzz-regexp.c
+	./fuzz-regexp
+
 $(BUILD_DIR):
 	cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DCMAKE_INSTALL_PREFIX=$(INSTALL_PREFIX)
 
@@ -146,4 +154,4 @@ unicode_gen: $(BUILD_DIR)
 libunicode-table.h: unicode_gen
 	$(BUILD_DIR)/unicode_gen unicode $@
 
-.PHONY: all amalgam ctest cxxtest debug fuzz jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench unicode_gen $(QJS) $(QJSC)
+.PHONY: all amalgam ctest cxxtest debug fuzz fuzz-eval fuzz-regexp jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench unicode_gen $(QJS) $(QJSC)

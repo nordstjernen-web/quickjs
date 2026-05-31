@@ -3,6 +3,7 @@
 *.so
 .obj/
 build/
+build-san/
 unicode/
 .idea
 cmake-*
@@ -10,5 +11,7 @@ cmake-*
 out/
 CMakeUserPresets.json
 fuzz
+fuzz-eval
+fuzz-regexp
 .vscode/
 microbench*.txt
