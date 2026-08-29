@@ -694,13 +694,15 @@ typedef struct JSClassDef {
     JSClassExoticMethods *exotic;
 } JSClassDef;
 
-#define JS_EVAL_OPTIONS_VERSION 1
+#define JS_EVAL_OPTIONS_VERSION 2
 
 typedef struct JSEvalOptions {
   int version;
   int eval_flags;
   const char *filename;
   int line_num;
+  // added in version 2
+  int col_num;
   // can add new fields in ABI-compatible manner by incrementing JS_EVAL_OPTIONS_VERSION
 } JSEvalOptions;
 
@@ -1449,7 +1451,7 @@ JS_EXTERN int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
 
 #define QJS_VERSION_MAJOR 0
 #define QJS_VERSION_MINOR 16
-#define QJS_VERSION_PATCH 1
+#define QJS_VERSION_PATCH 2
 #define QJS_VERSION_SUFFIX ""
 
 JS_EXTERN const char* JS_GetVersion(void);

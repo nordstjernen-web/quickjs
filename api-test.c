@@ -2,6 +2,7 @@
 #undef NDEBUG
 #endif
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "quickjs.h"
@@ -928,6 +929,189 @@ static void new_errors(void)
     JS_FreeRuntime(rt);
 }
 
+// returns "line:col" of the first frame of the exception raised by `code`
+// evaluated under `options`
+static const char *eval_loc(JSContext *ctx, const char *code, JSEvalOptions *options)
+{
+    static char buf[64];
+    JSValue ret, exc, stack;
+    const char *s, *p;
+
+    ret = JS_Eval2(ctx, code, strlen(code), options);
+    assert(JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    exc = JS_GetException(ctx);
+    stack = JS_GetPropertyStr(ctx, exc, "stack");
+    s = JS_ToCString(ctx, stack);
+    assert(s);
+    p = strstr(s, "eval.js:");
+    assert(p);
+    snprintf(buf, sizeof(buf), "%.*s", (int)strcspn(p + 8, "\n )"), p + 8);
+    JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, stack);
+    JS_FreeValue(ctx, exc);
+    return buf;
+}
+
+// JSEvalOptions.col_num shifts the first line only; later lines start at 1.
+static void eval_options_col_num(void)
+{
+    JSValue ret, exc;
+    const char *s;
+    JSEvalOptions options;
+
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+
+    options = (JSEvalOptions){
+        .version = JS_EVAL_OPTIONS_VERSION,
+        .filename = "eval.js",
+    };
+
+    // the baseline: three spaces then an undefined global, so column 4
+    assert(!strcmp(eval_loc(ctx, "   nope", &options), "1:4"));
+
+    // an unset col_num is column 1, and so is an explicit 1
+    options.col_num = 0;
+    assert(!strcmp(eval_loc(ctx, "   nope", &options), "1:4"));
+    options.col_num = 1;
+    assert(!strcmp(eval_loc(ctx, "   nope", &options), "1:4"));
+
+    // starting at column 10 moves the first line right by 9
+    options.col_num = 10;
+    assert(!strcmp(eval_loc(ctx, "   nope", &options), "1:13"));
+    assert(!strcmp(eval_loc(ctx, "nope", &options), "1:10"));
+
+    // a syntax error is placed the same way
+    assert(!strcmp(eval_loc(ctx, "let x = ;", &options), "1:18"));
+
+    // a large offset is carried through intact
+    options.col_num = 100000;
+    assert(!strcmp(eval_loc(ctx, "   nope", &options), "1:100003"));
+    options.col_num = 10;
+
+    // only the first line is shifted
+    assert(!strcmp(eval_loc(ctx, "1;\n   nope", &options), "2:4"));
+    assert(!strcmp(eval_loc(ctx, "1;\nlet y = ;", &options), "2:9"));
+
+    // col_num composes with line_num
+    options.line_num = 5;
+    assert(!strcmp(eval_loc(ctx, "   nope", &options), "5:13"));
+    assert(!strcmp(eval_loc(ctx, "1;\n   nope", &options), "6:4"));
+    options.line_num = 0;
+
+    // a version 1 caller has no col_num field at all, so a stale value in
+    // that position must be ignored rather than read
+    options.version = 1;
+    options.col_num = 10;
+    assert(!strcmp(eval_loc(ctx, "   nope", &options), "1:4"));
+    options.version = JS_EVAL_OPTIONS_VERSION;
+
+    // versions outside the supported range are refused
+    {
+        static const int bad[] = { 0, -1, JS_EVAL_OPTIONS_VERSION + 1 };
+        size_t i;
+        for (i = 0; i < countof(bad); i++) {
+            options.version = bad[i];
+            ret = JS_Eval2(ctx, "1", 1, &options);
+            assert(JS_IsException(ret));
+            JS_FreeValue(ctx, ret);
+            exc = JS_GetException(ctx);
+            s = JS_ToCString(ctx, exc);
+            assert(s);
+            assert(!strcmp(s, "InternalError: bad JSEvalOptions version"));
+            JS_FreeCString(ctx, s);
+            JS_FreeValue(ctx, exc);
+        }
+        options.version = JS_EVAL_OPTIONS_VERSION;
+    }
+
+    // a successful eval is unaffected by the offset
+    options.col_num = 10;
+    ret = JS_Eval2(ctx, "1 + 1", 5, &options);
+    assert(!JS_IsException(ret));
+    assert(JS_VALUE_GET_INT(ret) == 2);
+    JS_FreeValue(ctx, ret);
+
+    // negative offsets count backwards from the origin, the way negative
+    // line_num values do
+    options.col_num = -1;
+    assert(!strcmp(eval_loc(ctx, "   nope", &options), "1:2"));
+    options.col_num = -100000;
+    assert(!strcmp(eval_loc(ctx, "   nope", &options), "1:-99997"));
+
+    // every frame of a multi-frame stack is numbered from the same origin
+    options.col_num = 10;
+    options.line_num = 1;
+    assert(!strcmp(eval_loc(ctx, "function f() { nope }\n  f()", &options), "1:25"));
+    assert(!strcmp(eval_loc(ctx, "(function () { nope })()", &options), "1:25"));
+
+    // a module is offset the same way a script is
+    options.eval_flags = JS_EVAL_TYPE_MODULE;
+    assert(!strcmp(eval_loc(ctx, "  let x = ;", &options), "1:20"));
+    assert(!strcmp(eval_loc(ctx, "1;\nlet x = ;", &options), "2:9"));
+    options.eval_flags = 0;
+
+    // a source whose first line is empty is back to column 1 immediately
+    assert(!strcmp(eval_loc(ctx, "\n nope", &options), "2:2"));
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+// JS_NewContext() already installs DOMException by way of
+// JS_AddIntrinsicAToB(), so a host that also calls JS_AddIntrinsicDOMException()
+// explicitly installs it twice. The second install must release the prototype
+// the first one left in ctx->class_proto[] instead of overwriting the slot;
+// new_runtime() aborts at JS_FreeRuntime() if it does not.
+static void dom_exception_added_twice(void)
+{
+    JSValue ret;
+    const char *s;
+    int i;
+
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+
+    // the implicit install left a working DOMException behind
+    ret = eval(ctx, "DOMException.prototype === "
+                    "Object.getPrototypeOf(new DOMException)");
+    assert(JS_ToBool(ctx, ret) == true);
+    JS_FreeValue(ctx, ret);
+
+    // installing it again, repeatedly, must not leak the previous prototype
+    for (i = 0; i < 3; i++)
+        assert(JS_AddIntrinsicDOMException(ctx) == 0);
+
+    // and the class prototype still matches the global constructor, i.e. the
+    // slot tracks the newest install rather than a freed or stale object
+    ret = eval(ctx, "DOMException.prototype === "
+                    "Object.getPrototypeOf(new DOMException)");
+    assert(JS_ToBool(ctx, ret) == true);
+    JS_FreeValue(ctx, ret);
+
+    ret = eval(ctx, "new DOMException('m', 'InvalidCharacterError').name");
+    assert(!JS_IsException(ret));
+    s = JS_ToCString(ctx, ret);
+    assert(s);
+    assert(!strcmp(s, "InvalidCharacterError"));
+    JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, ret);
+
+    // the internally thrown DOMExceptions pick up the current prototype too
+    ret = eval(ctx, "try { atob('a') } catch (e) { "
+                    "  e instanceof DOMException && e.name } ");
+    assert(!JS_IsException(ret));
+    s = JS_ToCString(ctx, ret);
+    assert(s);
+    assert(!strcmp(s, "InvalidCharacterError"));
+    JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, ret);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static void backtrace_oom_callsite_array(void)
 {
     static const char setup_code[] =
@@ -1822,6 +2006,182 @@ static void transfer_default_managed_array_buffer(void)
     JS_FreeRuntime(rt);
 }
 
+static void get_class_name(void)
+{
+    static const struct {
+        const char *code;
+        const char *name;
+    } builtins[] = {
+        { "({})",               "Object" },
+        { "[]",                 "Array" },
+        { "new Error()",        "Error" },
+        { "new Date()",         "Date" },
+        { "/re/",               "RegExp" },
+        { "new Map()",          "Map" },
+        { "new ArrayBuffer(0)", "ArrayBuffer" },
+        { "new Uint8Array(0)",  "Uint8Array" },
+        { "(function(){})",     "Function" },
+    };
+    JSClassDef def = (JSClassDef){ .class_name = "MyClass" };
+    JSClassID class_id, unregistered_class_id;
+    JSAtom atom, expected;
+    JSRuntime *rt;
+    JSContext *ctx;
+    const char *s;
+    JSValue obj;
+    size_t i;
+
+    rt = new_runtime();
+    class_id = 0;
+    JS_NewClassID(rt, &class_id);
+    assert(0 == JS_NewClass(rt, class_id, &def));
+
+    /* handed out by JS_NewClassID() but never passed to JS_NewClass() */
+    unregistered_class_id = 0;
+    JS_NewClassID(rt, &unregistered_class_id);
+
+    ctx = JS_NewContext(rt);
+
+    /* the name of a class registered from C, not its class id */
+    expected = JS_NewAtom(ctx, "MyClass");
+    atom = JS_GetClassName(rt, class_id);
+    assert(atom == expected);
+    s = JS_AtomToCString(ctx, atom);
+    assert(s);
+    assert(!strcmp(s, "MyClass"));
+    JS_FreeCString(ctx, s);
+    JS_FreeAtom(ctx, atom);
+    JS_FreeAtom(ctx, expected);
+
+    /* the names of the built-in classes */
+    for (i = 0; i < countof(builtins); i++) {
+        obj = eval(ctx, builtins[i].code);
+        assert(!JS_IsException(obj));
+        atom = JS_GetClassName(rt, JS_GetClassID(obj));
+        assert(atom != JS_ATOM_NULL);
+        s = JS_AtomToCString(ctx, atom);
+        assert(s);
+        assert(!strcmp(s, builtins[i].name));
+        JS_FreeCString(ctx, s);
+        JS_FreeAtom(ctx, atom);
+        JS_FreeValue(ctx, obj);
+    }
+
+    /* class ids without a registered class have no name */
+    assert(JS_ATOM_NULL == JS_GetClassName(rt, JS_INVALID_CLASS_ID));
+    assert(JS_ATOM_NULL == JS_GetClassName(rt, unregistered_class_id));
+    assert(JS_ATOM_NULL == JS_GetClassName(rt, class_id + 4096));
+
+    /* the caller owns the returned atom; the class keeps its own reference,
+       so releasing it repeatedly doesn't free the name out from under it */
+    for (i = 0; i < 64; i++)
+        JS_FreeAtom(ctx, JS_GetClassName(rt, class_id));
+    atom = JS_GetClassName(rt, class_id);
+    s = JS_AtomToCString(ctx, atom);
+    assert(s);
+    assert(!strcmp(s, "MyClass"));
+    JS_FreeCString(ctx, s);
+    JS_FreeAtom(ctx, atom);
+
+    /* every registered class has a name, and it is a name rather than a
+       number: returning the class id instead produced a valid-looking atom,
+       either an unrelated predefined one for a small id or the id spelled out
+       in decimal for a large one, so check the whole table rather than the
+       handful of classes spelled out above */
+    {
+        JSClassID id;
+        int registered = 0;
+
+        for (id = 1; id < class_id + 16; id++) {
+            char decimal[32];
+            if (!JS_IsRegisteredClass(rt, id))
+                continue;
+            registered++;
+            atom = JS_GetClassName(rt, id);
+            assert(atom != JS_ATOM_NULL);
+            s = JS_AtomToCString(ctx, atom);
+            assert(s);
+            // a few internal classes are deliberately unnamed, but none is
+            // named after a number
+            snprintf(decimal, sizeof(decimal), "%u", (unsigned)id);
+            assert(strcmp(s, decimal));
+            assert(s[0] < '0' || s[0] > '9');
+            JS_FreeCString(ctx, s);
+            JS_FreeAtom(ctx, atom);
+        }
+        /* the built-ins alone are far more than this */
+        assert(registered > 20);
+    }
+
+    /* two classes sharing a name share the interned atom, and the name does
+       not depend on which context asks */
+    {
+        JSClassDef def2 = (JSClassDef){ .class_name = "MyClass" };
+        JSClassID class_id2 = 0;
+        JSContext *ctx2;
+        JSAtom a1, a2;
+
+        JS_NewClassID(rt, &class_id2);
+        assert(0 == JS_NewClass(rt, class_id2, &def2));
+        assert(class_id2 != class_id);
+
+        a1 = JS_GetClassName(rt, class_id);
+        a2 = JS_GetClassName(rt, class_id2);
+        assert(a1 == a2);
+        JS_FreeAtom(ctx, a1);
+        JS_FreeAtom(ctx, a2);
+
+        ctx2 = JS_NewContext(rt);
+        a1 = JS_GetClassName(rt, class_id);
+        a2 = JS_GetClassName(rt, class_id);
+        assert(a1 == a2);
+        JS_FreeAtom(ctx2, a1);
+        JS_FreeAtom(ctx2, a2);
+        JS_FreeContext(ctx2);
+    }
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+void object_from(void)
+{
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue t0 = JS_NewObject(ctx);
+    assert(!JS_IsException(t0));
+    assert(JS_IsObject(t0));
+    JSAtom prop = JS_NewAtomLen(ctx, "prop", 4);
+    assert(prop != JS_ATOM_NULL);
+    JSValue val = JS_NULL;
+    JSValue t1 = JS_NewObjectFrom(ctx, 1, &prop, &val);
+    assert(!JS_IsException(t1));
+    assert(JS_IsObject(t1));
+    uint32_t old_shape_hash_count = js_std_cmd(/*GetShapeHashCount*/4, rt);
+    JSValue t2 = JS_NewObjectFrom(ctx, 1, &prop, &val);
+    assert(!JS_IsException(t2));
+    assert(JS_IsObject(t2));
+    uint32_t new_shape_hash_count = js_std_cmd(/*GetShapeHashCount*/4, rt);
+    assert(old_shape_hash_count == new_shape_hash_count);
+    JS_FreeAtom(ctx, prop);
+    JS_FreeValue(ctx, t2);
+    JS_FreeValue(ctx, t1);
+    JS_FreeValue(ctx, t0);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+void add_intrinsic_bigint(void)
+{
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContextRaw(rt);
+    JS_AddIntrinsicBaseObjects(ctx);
+    JS_AddIntrinsicBigInt(ctx);
+    assert(!JS_HasException(ctx));
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     cfunctions();
@@ -1840,6 +2200,8 @@ int main(void)
     promise_hook();
     dump_memory_usage();
     new_errors();
+    eval_options_col_num();
+    dom_exception_added_twice();
     backtrace_oom_current_exception();
     backtrace_oom_callsite_array();
     proxy_own_keys_huge_length();
@@ -1855,5 +2217,8 @@ int main(void)
     transfer_external_array_buffer();
     resize_external_array_buffer();
     transfer_default_managed_array_buffer();
+    get_class_name();
+    object_from();
+    add_intrinsic_bigint();
     return 0;
 }
